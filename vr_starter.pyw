@@ -10,8 +10,16 @@ Werkt als gewone app (GitHub-download) en als Microsoft Store-app (MSIX).
 Gebruikt enkel de standaardbibliotheek van Python.
 """
 
+import base64
+import csv
+import email.utils
+import gzip
+import hashlib
 import html as html_lib
 import json
+import random
+import socket
+import struct
 import os
 import shutil
 import subprocess
@@ -29,7 +37,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "VR-viewer starter"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 # Alles wat de app bewaart, staat in de gebruikersmap (AppData\Local).
 # Een Store-app (MSIX) mag niet in zijn eigen installatiemap schrijven.
@@ -162,6 +170,289 @@ def scan_folder(folder):
     return html, models
 
 
+# ======================================================================== SAMEN (gedeeld)
+# Dit blok staat identiek in server.py (Ponte_VR). Pas het op beide plaatsen aan.
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+GZIP_EXT = {".html", ".htm", ".js", ".mjs", ".css", ".json", ".glb", ".gltf", ".svg", ".txt", ".csv", ".obj", ".bin"}
+LOG_FIELDS = ["duur_s", "gevoel", "voorinstelling", "beweeg", "draai", "snelheid", "vignet", "zweef", "ring", "samen", "pagina", "toestel"]
+_GZ_CACHE = {}
+_GZ_LOCK = threading.Lock()
+_LOG_LOCK = threading.Lock()
+
+
+def is_websocket(handler):
+    return "websocket" in handler.headers.get("Upgrade", "").lower()
+
+
+class WSConn:
+    """Minimale WebSocket-verbinding (RFC 6455), enkel tekstberichten."""
+
+    def __init__(self, handler):
+        self.rfile = handler.rfile
+        self.sock = handler.connection
+        self.wlock = threading.Lock()
+        self.closed = False
+        self.sock.settimeout(90)          # de viewer stuurt elke 25 s een teken van leven
+
+    def _read(self, n):
+        data = self.rfile.read(n)
+        if data is None or len(data) < n:
+            raise EOFError
+        return data
+
+    def recv(self):
+        """Volgend tekstbericht, of None als de verbinding dicht is."""
+        parts = bytearray()
+        try:
+            while True:
+                b0, b1 = self._read(2)
+                fin, op = b0 & 0x80, b0 & 0x0F
+                n = b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._read(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._read(8))[0]
+                if n > (1 << 20):
+                    return None
+                mask = self._read(4) if b1 & 0x80 else b"\0\0\0\0"
+                data = bytearray(self._read(n)) if n else bytearray()
+                for i in range(n):
+                    data[i] ^= mask[i & 3]
+                if op == 0x8:                 # sluiten
+                    return None
+                if op == 0x9:                 # ping -> pong
+                    self._frame(0xA, bytes(data))
+                    continue
+                if op == 0xA:
+                    continue
+                parts += data
+                if fin:
+                    return parts.decode("utf-8", "replace")
+        except (EOFError, OSError, ValueError):
+            return None
+
+    def _frame(self, op, payload):
+        n = len(payload)
+        if n < 126:
+            head = struct.pack(">BB", 0x80 | op, n)
+        elif n < 65536:
+            head = struct.pack(">BBH", 0x80 | op, 126, n)
+        else:
+            head = struct.pack(">BBQ", 0x80 | op, 127, n)
+        with self.wlock:
+            if self.closed:
+                return
+            try:
+                self.sock.sendall(head + payload)
+            except OSError:
+                self.closed = True
+
+    def send(self, obj):
+        self._frame(0x1, json.dumps(obj, separators=(",", ":")).encode("utf-8"))
+
+    def close(self):
+        if not self.closed:
+            self._frame(0x8, b"")
+            self.closed = True
+
+
+class SamenRelay:
+    """Eén klas per server. De docent stuurt de toestand en zijn positie; de studenten volgen."""
+
+    def __init__(self, pin=None):
+        self.pin = pin or "%04d" % random.SystemRandom().randint(0, 9999)
+        self.lock = threading.Lock()
+        self.clients = {}      # WSConn -> {"id", "rol", "naam"}
+        self.state = None      # laatste toestand van de docent
+        self.pose = None       # laatste positie en aanwijsstraal van de docent
+        self.nr = 0
+
+    # ---- verbinding
+    def handle(self, handler):
+        key = handler.headers.get("Sec-WebSocket-Key")
+        if not key:
+            handler.send_error(400, "WebSocket verwacht")
+            return
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        handler.send_response(101, "Switching Protocols")
+        handler.send_header("Upgrade", "websocket")
+        handler.send_header("Connection", "Upgrade")
+        handler.send_header("Sec-WebSocket-Accept", accept)
+        handler.end_headers()
+        handler.close_connection = True
+        conn, info = WSConn(handler), None
+        try:
+            while True:
+                txt = conn.recv()
+                if txt is None:
+                    break
+                try:
+                    msg = json.loads(txt)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if info is None:
+                    if msg.get("t") == "hallo":
+                        info = self._join(conn, msg)
+                    continue
+                self._on_message(conn, info, msg)
+        finally:
+            conn.close()
+            if info:
+                self._leave(conn, info)
+
+    def _join(self, conn, msg):
+        reden = ""
+        with self.lock:
+            self.nr += 1
+            rol = msg.get("rol") if msg.get("rol") in ("docent", "student") else "student"
+            if rol == "docent" and str(msg.get("pin", "")).strip() != self.pin:
+                rol, reden = "student", "Verkeerde PIN: je bent verbonden als student."
+            naam = str(msg.get("naam") or "").strip()[:24]
+            if not naam:
+                naam = "Docent" if rol == "docent" else "Student %d" % self.nr
+            info = {"id": self.nr, "rol": rol, "naam": naam}
+            self.clients[conn] = info
+            state, pose = self.state, self.pose
+        conn.send({"t": "welkom", "id": info["id"], "rol": rol, "naam": naam, "reden": reden})
+        if rol == "student":
+            if state is not None:
+                conn.send({"t": "toestand", "s": state})
+            if pose is not None:
+                conn.send(pose)
+        self._send_list()
+        return info
+
+    def _leave(self, conn, info):
+        with self.lock:
+            self.clients.pop(conn, None)
+            if not any(i["rol"] == "docent" for i in self.clients.values()):
+                self.pose = None
+        if info["rol"] == "student":
+            self._send_to("docent", {"t": "weg", "id": info["id"]})
+        self._send_list()
+
+    def _on_message(self, conn, info, msg):
+        t = msg.get("t")
+        if info["rol"] == "docent":
+            if t == "toestand" and isinstance(msg.get("s"), dict):
+                with self.lock:
+                    self.state = msg["s"]
+                self._send_to("student", {"t": "toestand", "s": msg["s"]})
+            elif t == "pose":
+                pose = {"t": "pose", "p": msg.get("p"), "y": msg.get("y"), "h": msg.get("h"),
+                        "e": msg.get("e"), "hit": bool(msg.get("hit"))}
+                with self.lock:
+                    self.pose = pose
+                self._send_to("student", pose)
+            elif t == "roep":
+                self._send_to("student", {"t": "roep"})
+        elif t == "pose":
+            self._send_to("docent", {"t": "spose", "id": info["id"], "naam": info["naam"],
+                                     "p": msg.get("p"), "y": msg.get("y")})
+
+    # ---- versturen
+    def _send_to(self, rol, obj):
+        with self.lock:
+            targets = [c for c, i in self.clients.items() if i["rol"] == rol]
+        for c in targets:
+            c.send(obj)
+
+    def _send_list(self):
+        with self.lock:
+            studenten = [{"id": i["id"], "naam": i["naam"]} for i in self.clients.values() if i["rol"] == "student"]
+            docent = any(i["rol"] == "docent" for i in self.clients.values())
+            targets = list(self.clients)
+        for c in targets:
+            c.send({"t": "lijst", "studenten": studenten, "docent": docent})
+
+    def counts(self):
+        with self.lock:
+            rollen = [i["rol"] for i in self.clients.values()]
+        return rollen.count("docent"), rollen.count("student")
+
+
+def send_gzip(handler):
+    """Stuurt een bestand gecomprimeerd. Geeft False terug als de gewone weg moet."""
+    if "gzip" not in handler.headers.get("Accept-Encoding", ""):
+        return False
+    path = handler.translate_path(handler.path)
+    if os.path.isdir(path):
+        if not handler.path.split("?", 1)[0].endswith("/"):
+            return False
+        path = os.path.join(path, "index.html")
+    if not os.path.isfile(path) or os.path.splitext(path)[1].lower() not in GZIP_EXT:
+        return False
+    st = os.stat(path)
+    ims = handler.headers.get("If-Modified-Since")
+    if ims:
+        try:
+            if email.utils.parsedate_to_datetime(ims).timestamp() >= int(st.st_mtime):
+                handler.send_response(304)
+                handler.send_header("Last-Modified", handler.date_time_string(st.st_mtime))
+                handler.end_headers()
+                return True
+        except (TypeError, ValueError, OverflowError, IndexError):
+            pass
+    key = (path, st.st_mtime_ns, st.st_size)
+    with _GZ_LOCK:
+        data = _GZ_CACHE.get(key)
+    if data is None:
+        with open(path, "rb") as f:
+            data = gzip.compress(f.read(), 6)
+        with _GZ_LOCK:
+            if len(_GZ_CACHE) > 24:
+                _GZ_CACHE.clear()
+            _GZ_CACHE[key] = data
+    handler.send_response(200)
+    handler.send_header("Content-Type", handler.guess_type(path))
+    handler.send_header("Content-Encoding", "gzip")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Last-Modified", handler.date_time_string(st.st_mtime))
+    handler.send_header("Vary", "Accept-Encoding")
+    handler.end_headers()
+    if handler.command != "HEAD":
+        handler.wfile.write(data)
+    return True
+
+
+def write_log(handler, folder):
+    """POST /log: een regel per VR-sessie in vr_log.csv (puntkomma's, opent rechtstreeks in Excel)."""
+    try:
+        n = int(handler.headers.get("Content-Length") or 0)
+        if n > 8000:
+            handler.send_error(413)
+            return
+        data = json.loads(handler.rfile.read(n) or b"{}")
+        if not isinstance(data, dict):
+            raise ValueError
+    except ValueError:
+        handler.send_error(400)
+        return
+    row = [time.strftime("%Y-%m-%d %H:%M:%S")] + [str(data.get(k, ""))[:80].replace("\n", " ") for k in LOG_FIELDS]
+    path = os.path.join(folder, "vr_log.csv")
+    try:
+        with _LOG_LOCK:
+            new = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f, delimiter=";")
+                if new:
+                    w.writerow(["tijd"] + LOG_FIELDS)
+                w.writerow(row)
+    except OSError:
+        handler.send_error(500)
+        return
+    handler.send_response(204)
+    handler.end_headers()
+
+# ======================================================================== einde SAMEN
+
+# Eén Samen-relais voor de hele app: de docent-PIN blijft gelijk zolang de app open is.
+RELAY = SamenRelay()
+
+
 def pretty(rel):
     return rel.replace("/", " › ")
 
@@ -180,15 +471,31 @@ class QuietHandler(SimpleHTTPRequestHandler):
         pass
 
     def end_headers(self):
-        # altijd de nieuwste versie tonen (handig als je het bestand aanpast)
-        self.send_header("Cache-Control", "no-store")
+        # Altijd de nieuwste versie tonen, maar een ongewijzigd bestand niet opnieuw versturen
+        # (304). Samen met gzip spaart dat veel van het gratis ngrok-dataverkeer.
+        self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
     # Het hoofdadres toont een startpagina met alle modellen (grote knoppen voor de Quest).
     def do_GET(self):
-        if urllib.parse.urlsplit(self.path).path == "/":
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/":
             return self.send_start_page()
+        if path == "/samen":                       # Samen-modus: docent leidt, studenten kijken mee
+            if is_websocket(self):
+                return RELAY.handle(self)
+            self.send_error(426, "Gebruik een WebSocket")
+            return None
+        if send_gzip(self):
+            return None
         return super().do_GET()
+
+    def do_POST(self):
+        # /log: na elke VR-sessie een regel in vr_log.csv in je modellenmap (comfort en misselijkheid)
+        if urllib.parse.urlsplit(self.path).path == "/log":
+            return write_log(self, self.directory)
+        self.send_error(404)
+        return None
 
     def do_HEAD(self):
         if urllib.parse.urlsplit(self.path).path == "/":
@@ -294,6 +601,16 @@ HELP_TEXT = [
     ("b", "Klik op ‘Visit Site’ als ngrok dat vraagt, kies een model en druk op ‘Start VR’."),
     ("b", "Maak een bladwijzer van de startpagina (werkt het best met een vast adres)."),
     ("b", "Laat de app open zolang je de Quest gebruikt."),
+    ("h", "Samen kijken met de klas"),
+    ("p", "Viewers met een Samen-knop (zoals de Ponte-viewer) laten de docent leiden: de studenten zien "
+          "dezelfde studiemodus, de docent als gele figuur en zijn aanwijsstraal. Iedereen beweegt zelf."),
+    ("b", "Docent: Samen > Ik ben de docent, en typ de Docent-PIN die in stap 3 van deze app staat."),
+    ("b", "Studenten: Samen > Ik ben student. Er is geen code nodig."),
+    ("b", "Elke bril gebruikt één verbinding, dus het gratis ngrok-account volstaat ook voor een klas."),
+    ("h", "Comfort en vr_log.csv"),
+    ("p", "Met de knop Comfort kies je teleport, tunnelzicht en draaien in stappen tegen misselijkheid. "
+          "Na elke VR-sessie vraagt de viewer anoniem hoe je je voelde. Dat komt in vr_log.csv in je "
+          "modellenmap: bruikbaar voor onderzoek naar misselijkheid."),
     ("h", "Problemen"),
     ("b", "‘ngrok draait nog ergens anders’: kies Ja om de oude ngrok te stoppen. "
           "Gebruik je hetzelfde account op een andere computer, stop het dan daar."),
@@ -469,6 +786,8 @@ class App:
         brow.pack(anchor="w")
         ttk.Button(brow, text="Kopieer link", command=self.copy_link).pack(side="left")
         ttk.Button(brow, text="Test op deze computer", command=self.open_local).pack(side="left", padx=(8, 0))
+        ttk.Label(brow, text="Docent-PIN voor Samen:  " + RELAY.pin, style="Card.TLabel",
+                  font=("Segoe UI Semibold", 10)).pack(side="left", padx=(16, 0))
 
         tip = ("Tip: maak op de Quest een bladwijzer van de link. Klik op ‘Visit Site’ als ngrok dat vraagt "
                "en druk op ‘Start VR’. Laat dit venster open zolang je de Quest gebruikt.")
