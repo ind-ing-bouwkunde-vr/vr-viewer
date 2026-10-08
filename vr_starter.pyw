@@ -4,7 +4,7 @@ VR-viewer starter
 -----------------
 Kies een map met je VR-pagina's (HTML) en klik op Start.
 De app start zelf een lokale webserver en een ngrok-tunnel en toont
-de https-link die je op de Meta Quest intypt.
+de https-link en een QR-code die je met de Meta Quest scant.
 
 Werkt als gewone app (GitHub-download) en als Microsoft Store-app (MSIX).
 Gebruikt enkel de standaardbibliotheek van Python.
@@ -37,7 +37,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "VR-viewer starter"
-APP_VERSION = "2.2.0"
+APP_VERSION = "3.2.0"
 
 # Alles wat de app bewaart, staat in de gebruikersmap (AppData\Local).
 # Een Store-app (MSIX) mag niet in zijn eigen installatiemap schrijven.
@@ -51,6 +51,7 @@ NGROK_TOKEN_PAGE = "https://dashboard.ngrok.com/get-started/your-authtoken"
 NGROK_SIGNUP_PAGE = "https://dashboard.ngrok.com/signup"
 NGROK_DOMAIN_PAGE = "https://dashboard.ngrok.com/domains"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+QR_SMALL = 150  # px, QR-code in het hoofdvenster
 
 HTML_EXT = (".html", ".htm")
 MODEL_EXT = (".glb", ".gltf")
@@ -168,6 +169,269 @@ def scan_folder(folder):
                 models.append(rel)
     html.sort(key=lambda p: (p.count("/"), p.lower()))
     return html, models
+
+
+# ======================================================================== QR-CODE (zonder extra bibliotheken)
+# Gebaseerd op het algoritme van Project Nayuki (MIT). Bytemodus, foutcorrectie M of L, versie 1-40.
+
+_QR_ECC = {  # codewoorden foutcorrectie per blok, per versie (index 0 ongebruikt)
+    "L": (-1, 7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30, 30, 26, 28,
+          30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30),
+    "M": (-1, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26, 30, 22, 22, 24, 24, 28, 28, 26, 26, 26, 26, 28, 28, 28, 28, 28,
+          28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28, 28),
+}
+_QR_BLOCKS = {
+    "L": (-1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9, 10, 12, 12, 12, 13, 14, 15, 16, 17,
+          18, 19, 19, 20, 21, 22, 24, 25),
+    "M": (-1, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5, 5, 8, 9, 9, 10, 10, 11, 13, 14, 16, 17, 17, 18, 20, 21, 23, 25, 26, 28, 29,
+          31, 33, 35, 37, 38, 40, 43, 45, 47, 49),
+}
+_QR_FORMAT = {"L": 1, "M": 0}
+
+
+def _gf_mul(x, y):
+    z = 0
+    for i in range(7, -1, -1):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z
+
+
+def _rs_divisor(degree):
+    res = [0] * (degree - 1) + [1]
+    root = 1
+    for _ in range(degree):
+        for j in range(degree):
+            res[j] = _gf_mul(res[j], root)
+            if j + 1 < degree:
+                res[j] ^= res[j + 1]
+        root = _gf_mul(root, 0x02)
+    return res
+
+
+def _rs_remainder(data, divisor):
+    res = [0] * len(divisor)
+    for b in data:
+        factor = b ^ res.pop(0)
+        res.append(0)
+        for i, coef in enumerate(divisor):
+            res[i] ^= _gf_mul(coef, factor)
+    return res
+
+
+def _raw_modules(ver):
+    n = (16 * ver + 128) * ver + 64
+    if ver >= 2:
+        na = ver // 7 + 2
+        n -= (25 * na - 10) * na - 55
+        if ver >= 7:
+            n -= 36
+    return n
+
+
+def _data_codewords(ver, ecl):
+    return _raw_modules(ver) // 8 - _QR_ECC[ecl][ver] * _QR_BLOCKS[ecl][ver]
+
+
+def qr_matrix(text, ecl="M"):
+    """Geeft een vierkante lijst van lijsten met True (zwart) / False (wit) terug, zonder witte rand."""
+    data = text.encode("utf-8")
+    for ver in range(1, 41):
+        cc = 8 if ver <= 9 else 16
+        if 4 + cc + 8 * len(data) <= _data_codewords(ver, ecl) * 8:
+            break
+    else:
+        raise ValueError("Tekst te lang voor een QR-code")
+    bits = []
+
+    def put(val, n):
+        bits.extend((val >> i) & 1 for i in range(n - 1, -1, -1))
+
+    put(4, 4)
+    put(len(data), cc)
+    for b in data:
+        put(b, 8)
+    cap = _data_codewords(ver, ecl) * 8
+    put(0, min(4, cap - len(bits)))
+    put(0, (-len(bits)) % 8)
+    pad = 0xEC
+    while len(bits) < cap:
+        put(pad, 8)
+        pad ^= 0xEC ^ 0x11
+    words = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+
+    # foutcorrectie en verweven
+    nblocks, ecclen = _QR_BLOCKS[ecl][ver], _QR_ECC[ecl][ver]
+    raw = _raw_modules(ver) // 8
+    nshort = nblocks - raw % nblocks
+    shortlen = raw // nblocks
+    div = _rs_divisor(ecclen)
+    blocks, k = [], 0
+    for i in range(nblocks):
+        dat = words[k:k + shortlen - ecclen + (0 if i < nshort else 1)]
+        k += len(dat)
+        ecc = _rs_remainder(dat, div)
+        if i < nshort:
+            dat = dat + [0]
+        blocks.append(dat + ecc)
+    final = []
+    for i in range(len(blocks[0])):
+        for j, blk in enumerate(blocks):
+            if i != shortlen - ecclen or j >= nshort:
+                final.append(blk[i])
+
+    size = ver * 4 + 17
+    mod = [[False] * size for _ in range(size)]
+    fun = [[False] * size for _ in range(size)]
+
+    def setf(x, y, dark):
+        mod[y][x] = dark
+        fun[y][x] = True
+
+    for i in range(size):
+        setf(6, i, i % 2 == 0)
+        setf(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                x, y = cx + dx, cy + dy
+                if 0 <= x < size and 0 <= y < size:
+                    setf(x, y, max(abs(dx), abs(dy)) not in (2, 4))
+    if ver > 1:
+        na = ver // 7 + 2
+        step = (ver * 8 + na * 3 + 5) // (na * 4 - 4) * 2
+        pos = [6] + sorted(size - 7 - i * step for i in range(na - 1))
+        last = len(pos) - 1
+        for i in range(len(pos)):
+            for j in range(len(pos)):
+                if (i == 0 and j == 0) or (i == 0 and j == last) or (i == last and j == 0):
+                    continue
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        setf(pos[i] + dx, pos[j] + dy, max(abs(dx), abs(dy)) != 1)
+
+    def draw_format(mask):
+        d = _QR_FORMAT[ecl] << 3 | mask
+        rem = d
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        b = (d << 10 | rem) ^ 0x5412
+        bit = lambda i: (b >> i) & 1 == 1  # noqa: E731
+        for i in range(6):
+            setf(8, i, bit(i))
+        setf(8, 7, bit(6))
+        setf(8, 8, bit(7))
+        setf(7, 8, bit(8))
+        for i in range(9, 15):
+            setf(14 - i, 8, bit(i))
+        for i in range(8):
+            setf(size - 1 - i, 8, bit(i))
+        for i in range(8, 15):
+            setf(8, size - 15 + i, bit(i))
+        setf(8, size - 8, True)
+
+    draw_format(0)
+    if ver >= 7:
+        rem = ver
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        b = ver << 12 | rem
+        for i in range(18):
+            dark = (b >> i) & 1 == 1
+            a, c = size - 11 + i % 3, i // 3
+            setf(a, c, dark)
+            setf(c, a, dark)
+
+    # datamodules in zigzag plaatsen
+    i, right = 0, size - 1
+    total = len(final) * 8
+    while right >= 1:
+        if right == 6:
+            right = 5
+        for vert in range(size):
+            for j in range(2):
+                x = right - j
+                y = size - 1 - vert if ((right + 1) & 2) == 0 else vert
+                if not fun[y][x] and i < total:
+                    mod[y][x] = (final[i >> 3] >> (7 - (i & 7))) & 1 == 1
+                    i += 1
+        right -= 2
+
+    masks = (
+        lambda x, y: (x + y) % 2 == 0, lambda x, y: y % 2 == 0, lambda x, y: x % 3 == 0,
+        lambda x, y: (x + y) % 3 == 0, lambda x, y: (x // 3 + y // 2) % 2 == 0,
+        lambda x, y: x * y % 2 + x * y % 3 == 0, lambda x, y: (x * y % 2 + x * y % 3) % 2 == 0,
+        lambda x, y: ((x + y) % 2 + x * y % 3) % 2 == 0,
+    )
+
+    def apply(m):
+        f = masks[m]
+        for y in range(size):
+            for x in range(size):
+                if not fun[y][x] and f(x, y):
+                    mod[y][x] = not mod[y][x]
+
+    def penalty():
+        p = 0
+        lines = [mod[y] for y in range(size)] + [[mod[y][x] for y in range(size)] for x in range(size)]
+        for line in lines:
+            run, prev = 0, None
+            for v in line:
+                if v == prev:
+                    run += 1
+                else:
+                    if run >= 5:
+                        p += run - 2
+                    run, prev = 1, v
+            if run >= 5:
+                p += run - 2
+            s = "".join("1" if v else "0" for v in line)
+            p += 40 * (s.count("10111010000") + s.count("00001011101"))
+        for y in range(size - 1):
+            for x in range(size - 1):
+                c = mod[y][x]
+                if c == mod[y][x + 1] == mod[y + 1][x] == mod[y + 1][x + 1]:
+                    p += 3
+        dark = sum(sum(r) for r in mod)
+        p += abs(dark * 100 // (size * size) - 50) // 5 * 10
+        return p
+
+    best, best_p = 0, None
+    for m in range(8):
+        apply(m)
+        draw_format(m)
+        pen = penalty()
+        if best_p is None or pen < best_p:
+            best, best_p = m, pen
+        apply(m)          # terugdraaien (xor)
+    apply(best)
+    draw_format(best)
+    return mod
+
+
+def qr_png(matrix, path, scale=12, border=4):
+    """Bewaart de QR-code als PNG (zwart-wit), met enkel de standaardbibliotheek."""
+    import zlib
+    n = len(matrix)
+    side = (n + 2 * border) * scale
+    rows = []
+    for y in range(side):
+        my = y // scale - border
+        line = bytearray([0])
+        for x in range(side):
+            mx = x // scale - border
+            dark = 0 <= mx < n and 0 <= my < n and matrix[my][mx]
+            line.append(0 if dark else 255)
+        rows.append(bytes(line))
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 0, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(b"".join(rows), 9)) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
 
 
 # ======================================================================== SAMEN (gedeeld)
@@ -374,6 +638,33 @@ class SamenRelay:
         return rollen.count("docent"), rollen.count("student")
 
 
+def _cors(handler):
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Headers", "ngrok-skip-browser-warning, content-type")
+    handler.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+
+
+def send_ping(handler, relay):
+    """GET /ping: laat het startportaal (GitHub Pages) zien dat deze server aan staat."""
+    docent, studenten = relay.counts()
+    body = json.dumps({"ok": True, "samen": {"docent": docent > 0, "studenten": studenten}}).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    _cors(handler)
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def send_preflight(handler):
+    """OPTIONS: toestemming voor het portaal om /ping op te vragen."""
+    handler.send_response(204)
+    _cors(handler)
+    handler.send_header("Access-Control-Max-Age", "86400")
+    handler.end_headers()
+
+
 def send_gzip(handler):
     """Stuurt een bestand gecomprimeerd. Geeft False terug als de gewone weg moet."""
     if "gzip" not in handler.headers.get("Accept-Encoding", ""):
@@ -486,9 +777,14 @@ class QuietHandler(SimpleHTTPRequestHandler):
                 return RELAY.handle(self)
             self.send_error(426, "Gebruik een WebSocket")
             return None
+        if path == "/ping":                        # startportaal: staat deze server aan?
+            return send_ping(self, RELAY)
         if send_gzip(self):
             return None
         return super().do_GET()
+
+    def do_OPTIONS(self):
+        return send_preflight(self)
 
     def do_POST(self):
         # /log: na elke VR-sessie een regel in vr_log.csv in je modellenmap (comfort en misselijkheid)
@@ -601,6 +897,15 @@ HELP_TEXT = [
     ("b", "Klik op ‘Visit Site’ als ngrok dat vraagt, kies een model en druk op ‘Start VR’."),
     ("b", "Maak een bladwijzer van de startpagina (werkt het best met een vast adres)."),
     ("b", "Laat de app open zolang je de Quest gebruikt."),
+    ("h", "QR-code scannen"),
+    ("p", "Na Start toont de app een QR-code van het gekozen model (of van de startpagina). Studenten scannen "
+          "die met hun Quest en hoeven niets te typen."),
+    ("b", "Klik op ‘QR groot tonen’ om de code op de beamer te tonen."),
+    ("b", "Op de Quest 3 en 3S heb je een QR-scanner nodig, bv. de gratis app ‘QR Scanner’ uit de Meta Store. "
+          "Die installeer je één keer per bril."),
+    ("b", "Vink ‘meteen in Samen’ aan: dan komen studenten via de code meteen in de Samen-modus en volgen ze de docent."),
+    ("b", "Met een vast adres (stap 2) blijft de code altijd dezelfde. Bewaar hem dan met ‘QR opslaan…’ "
+          "en hang hem afgedrukt op in het lokaal."),
     ("h", "Samen kijken met de klas"),
     ("p", "Viewers met een Samen-knop (zoals de Ponte-viewer) laten de docent leiden: de studenten zien "
           "dezelfde studiemodus, de docent als gele figuur en zijn aanwijsstraal. Iedereen beweegt zelf."),
@@ -635,7 +940,7 @@ class App:
 
         root.title(APP_NAME)
         root.configure(bg=BG)
-        root.minsize(720, 820)
+        root.minsize(740, 900)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         try:
             self.logo = tk.PhotoImage(data=LOGO_PNG)
@@ -652,6 +957,7 @@ class App:
         self.refresh_files()
         self.refresh_ngrok_status()
         self.set_pill("Gestopt", "#4a5468")
+        self.draw_qr()
 
     # ---------- UI ----------
     def build_styles(self):
@@ -773,24 +1079,39 @@ class App:
         self.links.configure(yscrollcommand=sb.set)
         self.links.bind("<<ListboxSelect>>", lambda e: self.show_selected())
 
-        box = tk.Frame(b3, bg=YELLOW_SOFT, highlightbackground=YELLOW, highlightthickness=2)
-        box.pack(fill="x", pady=(10, 8))
-        tk.Label(box, text="Typ dit in de browser van je Quest:", bg=YELLOW_SOFT, fg=MUTED,
-                 font=("Segoe UI", 9)).pack(anchor="w", padx=12, pady=(8, 0))
+        qrow = tk.Frame(b3, bg=CARD)
+        qrow.pack(fill="x", pady=(10, 8))
+        qbox = tk.Frame(qrow, bg="#ffffff", highlightbackground=LINE, highlightthickness=1)
+        qbox.pack(side="right", padx=(10, 0))
+        self.qr_canvas = tk.Canvas(qbox, width=QR_SMALL, height=QR_SMALL, bg="#ffffff", highlightthickness=0,
+                                   cursor="hand2")
+        self.qr_canvas.pack(padx=4, pady=4)
+        self.qr_canvas.bind("<Button-1>", lambda e: self.show_qr_big())
+        box = tk.Frame(qrow, bg=YELLOW_SOFT, highlightbackground=YELLOW, highlightthickness=2)
+        box.pack(side="left", fill="both", expand=True)
+        tk.Label(box, text="Scan de QR-code met de Quest, of typ dit in de browser van je Quest:", bg=YELLOW_SOFT,
+                 fg=MUTED, font=("Segoe UI", 9), wraplength=420, justify="left").pack(anchor="w", padx=12, pady=(8, 0))
         self.big_link = tk.Label(box, text="—", bg=YELLOW_SOFT, fg=INK, font=("Consolas", 13, "bold"),
-                                 wraplength=640, justify="left")
+                                 wraplength=440, justify="left")
         self.big_link.pack(anchor="w", padx=12, pady=(2, 10))
         box.bind("<Configure>", lambda e: self.big_link.configure(wraplength=max(200, e.width - 30)))
 
+        self.samen_var = tk.BooleanVar(value=bool(self.settings.get("qr_samen")))
+        tk.Checkbutton(b3, text="Studenten komen via de link meteen in Samen (ze volgen de docent)",
+                       variable=self.samen_var, command=self.on_samen_toggle, bg=CARD, fg=INK,
+                       activebackground=CARD, selectcolor="#ffffff", font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 6))
+
         brow = ttk.Frame(b3, style="Card.TFrame")
         brow.pack(anchor="w")
-        ttk.Button(brow, text="Kopieer link", command=self.copy_link).pack(side="left")
+        ttk.Button(brow, text="QR groot tonen", command=self.show_qr_big).pack(side="left")
+        ttk.Button(brow, text="QR opslaan…", command=self.save_qr).pack(side="left", padx=(8, 0))
+        ttk.Button(brow, text="Kopieer link", command=self.copy_link).pack(side="left", padx=(8, 0))
         ttk.Button(brow, text="Test op deze computer", command=self.open_local).pack(side="left", padx=(8, 0))
         ttk.Label(brow, text="Docent-PIN voor Samen:  " + RELAY.pin, style="Card.TLabel",
                   font=("Segoe UI Semibold", 10)).pack(side="left", padx=(16, 0))
 
-        tip = ("Tip: maak op de Quest een bladwijzer van de link. Klik op ‘Visit Site’ als ngrok dat vraagt "
-               "en druk op ‘Start VR’. Laat dit venster open zolang je de Quest gebruikt.")
+        tip = ("Tip: toon de QR-code op de beamer, dan hoeft niemand te typen. Klik op ‘Visit Site’ als ngrok dat "
+               "vraagt en druk op ‘Start VR’. Laat dit venster open zolang je de Quest gebruikt.")
         ttk.Label(wrap, text=tip, style="Foot.TLabel", wraplength=620, justify="left").pack(anchor="w", pady=(2, 0))
         ttk.Label(wrap, text="Versie " + APP_VERSION, style="Foot.TLabel").pack(anchor="e", pady=(6, 0))
 
@@ -1200,6 +1521,9 @@ class App:
         self.links.delete(0, "end")
         self.link_targets = []
         self.big_link.configure(text="—")
+        self.draw_qr()
+        if getattr(self, "qr_win", None) and self.qr_win.winfo_exists():
+            self.qr_win.destroy()
 
     # ---------- links ----------
     def selected_link(self):
@@ -1208,13 +1532,104 @@ class App:
             return None
         return self.link_targets[sel[0]]
 
-    def show_selected(self):
+    def qr_target(self):
+        """De link voor de studenten: het gekozen model, eventueel meteen in Samen."""
         link = self.selected_link()
+        if link and self.samen_var.get() and not link.endswith("/"):
+            link += ("&" if "?" in link else "?") + "samen=student"
+        return link
+
+    def show_selected(self):
+        link = self.qr_target()
         # zonder https:// – dat hoef je op de Quest niet te typen
         self.big_link.configure(text=link.split("://", 1)[-1].rstrip("/") if link else "—")
+        self.draw_qr()
+
+    def on_samen_toggle(self):
+        self.settings["qr_samen"] = self.samen_var.get()
+        save_settings(self.settings)
+        self.show_selected()
+
+    @staticmethod
+    def qr_image(matrix, size_px, border=4):
+        n = len(matrix) + 2 * border
+        scale = max(1, size_px // n)
+        img = tk.PhotoImage(width=n * scale, height=n * scale)
+        img.put("#ffffff", to=(0, 0, n * scale, n * scale))
+        for y, row in enumerate(matrix):
+            for x, dark in enumerate(row):
+                if dark:
+                    x0, y0 = (x + border) * scale, (y + border) * scale
+                    img.put("#000000", to=(x0, y0, x0 + scale, y0 + scale))
+        return img
+
+    def draw_qr(self):
+        c = self.qr_canvas
+        c.delete("all")
+        link = self.qr_target()
+        if not link:
+            c.create_text(QR_SMALL // 2, QR_SMALL // 2, text="QR-code\nverschijnt\nna Start", fill=MUTED,
+                          font=("Segoe UI", 9), justify="center")
+            self.qr_small = None
+            return
+        self.qr_small = self.qr_image(qr_matrix(link), QR_SMALL)
+        c.create_image(QR_SMALL // 2, QR_SMALL // 2, image=self.qr_small)
+
+    def show_qr_big(self):
+        link = self.qr_target()
+        if not link:
+            messagebox.showinfo(APP_NAME, "Klik eerst op Start. Daarna verschijnt de QR-code.")
+            return
+        if getattr(self, "qr_win", None) and self.qr_win.winfo_exists():
+            self.qr_win.destroy()
+        w = tk.Toplevel(self.root, bg="#ffffff")
+        self.qr_win = w
+        w.title(APP_NAME + " – QR-code")
+        try:
+            w.iconphoto(False, self.logo)
+        except Exception:
+            pass
+        side = max(320, min(640, self.root.winfo_screenheight() - 330))
+        w.qr_img = self.qr_image(qr_matrix(link), side)
+        tk.Label(w, text="Scan deze code met je Meta Quest", bg="#ffffff", fg=INK,
+                 font=("Segoe UI Semibold", 22)).pack(pady=(22, 4))
+        tk.Label(w, text="Open de QR-scanner op de bril, kijk naar de code en open de link. "
+                         "Klik op ‘Visit Site’ en druk op ‘Start VR’.", bg="#ffffff", fg=MUTED,
+                 font=("Segoe UI", 12), wraplength=side + 120).pack(padx=30)
+        tk.Label(w, image=w.qr_img, bg="#ffffff").pack(pady=14)
+        tk.Label(w, text="of typ:  " + link.split("://", 1)[-1].rstrip("/"), bg="#ffffff", fg=INK,
+                 font=("Consolas", 14, "bold"), wraplength=side + 120).pack(padx=30)
+        tk.Button(w, text="Sluiten", command=w.destroy, bg="#f4f5f7", fg=INK, relief="flat",
+                  font=("Segoe UI Semibold", 11), padx=18, pady=4).pack(pady=(14, 20))
+        w.bind("<Escape>", lambda e: w.destroy())
+        w.lift()
+        w.focus_force()
+
+    def save_qr(self):
+        link = self.qr_target()
+        if not link:
+            messagebox.showinfo(APP_NAME, "Klik eerst op Start. Daarna verschijnt de QR-code.")
+            return
+        name = "qr-" + (link.rstrip("/").rsplit("/", 1)[-1].split("?")[0].rsplit(".", 1)[0] or "startpagina")
+        if link.endswith("/"):
+            name = "qr-startpagina"
+        path = filedialog.asksaveasfilename(title="QR-code bewaren", defaultextension=".png",
+                                            initialfile=name + ".png", filetypes=[("PNG-afbeelding", "*.png")])
+        if not path:
+            return
+        try:
+            qr_png(qr_matrix(link), path, scale=16)
+        except OSError as e:
+            messagebox.showerror(APP_NAME, "Bewaren lukte niet: {}".format(e))
+            return
+        tip = ("Je gebruikt een vast adres: deze code blijft geldig. Je kunt hem afdrukken en ophangen."
+               if self.settings.get("vast_adres") else
+               "Let op: zonder vast adres verandert de link bij elke start. Stel een vast adres in (stap 2) "
+               "als je de code wilt afdrukken.")
+        messagebox.showinfo(APP_NAME, "QR-code bewaard.\n\n" + tip)
 
     def copy_link(self):
-        link = self.selected_link()
+        link = self.qr_target()
         if not link:
             messagebox.showinfo(APP_NAME, "Start eerst en kies een model.")
             return
