@@ -1,0 +1,7 @@
+__pycache__/
+build/
+dist/
+output/
+*.spec
+VR-viewer starter.exe
+ngrok.exe
