@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testbrug VR</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #cfd8e3; font-family: system-ui, sans-serif; overflow: hidden; }
+  #info { position: absolute; left: 12px; bottom: 12px; background: rgba(28,35,48,.85); color: #fff;
+          padding: 10px 14px; border-radius: 6px; font-size: 14px; line-height: 1.4; }
+  #info b { color: #f2b705; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="info"><b>Testbrug</b> · stalen vakwerkbrug 20 m × 4 m × 2,5 m<br>
+Muis: slepen om te draaien, scrollen om te zoomen · Quest: linkerstick om te wandelen</div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { VRButton } from "three/addons/webxr/VRButton.js";
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType("local-floor");
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xcfd8e3);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x667788, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5); sun.position.set(10, 20, 8); scene.add(sun);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 500);
+camera.position.set(-6, 1.6, 8);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(10, 1.2, 0); controls.update();
+
+// grond
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(80, 80),
+  new THREE.MeshStandardMaterial({ color: 0x7c8a6a, roughness: 1 }));
+ground.rotation.x = -Math.PI / 2; ground.position.y = -0.01; scene.add(ground);
+
+// brug
+const steel = new THREE.MeshStandardMaterial({ color: 0x383e42, metalness: 0.6, roughness: 0.4 });
+const deckMat = new THREE.MeshStandardMaterial({ color: 0x8a9096, metalness: 0.5, roughness: 0.6 });
+const bridge = new THREE.Group(); scene.add(bridge);
+const L = 20, B = 4, H = 2.5, step = 2.5, s = 0.2;
+
+function beam(a, b, size = s) {
+  const d = new THREE.Vector3().subVectors(b, a);
+  const m = new THREE.Mesh(new THREE.BoxGeometry(size, size, d.length()), steel);
+  m.position.copy(a).addScaledVector(d, 0.5);
+  m.lookAt(b);
+  bridge.add(m);
+}
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+for (const z of [-B / 2, B / 2]) {
+  beam(V(0, 0, z), V(L, 0, z), 0.3);          // onderflens
+  beam(V(0, H, z), V(L, H, z), 0.3);          // bovenflens
+  for (let x = 0; x <= L + 1e-6; x += step) beam(V(x, 0, z), V(x, H, z));   // staanders
+  for (let i = 0, x = 0; x < L - 1e-6; x += step, i++) {                     // diagonalen
+    if (x < L / 2) beam(V(x, H, z), V(x + step, 0, z));
+    else beam(V(x, 0, z), V(x + step, H, z));
+  }
+}
+for (let x = 0; x <= L + 1e-6; x += step) {    // dwarsliggers onder en boven
+  beam(V(x, 0, -B / 2), V(x, 0, B / 2));
+  beam(V(x, H, -B / 2), V(x, H, B / 2), 0.14);
+}
+const deck = new THREE.Mesh(new THREE.BoxGeometry(L, 0.04, B - 0.2), deckMat);
+deck.position.set(L / 2, 0.17, 0); bridge.add(deck);
+bridge.position.set(0, 0, 0);
+
+// eenvoudig wandelen met de linkerstick in VR
+const rig = new THREE.Group(); rig.add(camera); scene.add(rig);
+renderer.xr.addEventListener("sessionstart", () => { rig.position.set(-3, 0, 0); rig.rotation.y = -Math.PI / 2; });
+renderer.xr.addEventListener("sessionend", () => {
+  rig.position.set(0, 0, 0); rig.rotation.y = 0;
+  camera.position.set(-6, 1.6, 8); controls.target.set(10, 1.2, 0); controls.update();
+});
+const clock = new THREE.Clock();
+const dir = new THREE.Vector3();
+
+renderer.setAnimationLoop(() => {
+  const dt = clock.getDelta();
+  const session = renderer.xr.getSession();
+  if (session) {
+    for (const src of session.inputSources) {
+      if (src.handedness !== "left" || !src.gamepad) continue;
+      const [, , x = 0, y = 0] = src.gamepad.axes;
+      if (Math.abs(x) + Math.abs(y) < 0.15) continue;
+      renderer.xr.getCamera().getWorldDirection(dir); dir.y = 0; dir.normalize();
+      const right = new THREE.Vector3(-dir.z, 0, dir.x);
+      rig.position.addScaledVector(dir, -y * 2 * dt).addScaledVector(right, x * 2 * dt);
+    }
+  } else {
+    controls.update();
+  }
+  renderer.render(scene, camera);
+});
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

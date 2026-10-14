@@ -1,0 +1,59 @@
+VR-VIEWER STARTER
+=================
+
+Met deze app bekijk je je constructie in VR op de Meta Quest, zonder
+terminalvensters, commando's of account.
+
+
+EERSTE KEER (±2 minuten)
+------------------------
+1. Installeer de app (VR-viewer-starter-setup.exe) of open ze vanuit
+   de Microsoft Store.
+2. Kies je map met VR-modellen en klik op Start.
+   De allereerste keer downloadt de app eenmalig het gratis programma
+   cloudflared (±55 MB). Daarna start alles vanzelf.
+
+Een account is niet nodig.
+
+
+ELKE KEER
+---------
+1. Open de app.
+2. Kies je hoofdmap met VR-modellen (bv. C:\VR-modellen). Modellen
+   mogen elk in een eigen submap staan; de app vindt ze allemaal.
+3. Klik op Start.
+4. Scan de QR-code met je Quest, of typ de link uit het gele vak in de
+   Browser-app van je Quest. Kies een model en druk op "Start VR".
+5. Klaar? Klik op Stop of sluit de app.
+
+De snellink verandert bij elke start. Toon dus telkens de QR-code
+(knop "QR groot tonen" voor de beamer).
+
+
+VASTE LINK NODIG?
+-----------------
+Voor een afgedrukte QR-code of een bladwijzer op de Quest kies je in
+stap 2 "Vaste link via ngrok". Daarvoor heb je een gratis account op
+ngrok.com nodig; de app helpt je bij het instellen.
+
+
+EERST UITTESTEN?
+----------------
+Klik op "Voorbeeld proberen". Daar staat een testbrug (stalen
+vakwerkbrug van 20 m) waarmee je kunt controleren of alles werkt.
+
+
+PROBLEMEN
+---------
+- "De snellink lukte niet": sommige netwerken blokkeren Cloudflare.
+  Probeer een ander netwerk (bv. de hotspot van je gsm) of kies ngrok.
+- De Quest vindt de site niet net na Start: wacht een halve minuut en
+  herlaad de pagina.
+- Windows toont "Windows heeft uw pc beveiligd": klik op
+  "Meer informatie" en dan "Toch uitvoeren".
+- De pagina blijft leeg op de Quest: klik op "Test op deze computer",
+  druk op F12, kopieer de rode foutmelding en vraag Claude om het
+  HTML-bestand te verbeteren.
+
+Je hoeft geen firewallregel toe te voegen: de app werkt enkel via een
+beveiligde tunnel, dus je computer staat niet open voor het netwerk.
