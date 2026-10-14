@@ -1,0 +1,83 @@
+name: App bouwen
+
+# Wanneer bouwt GitHub de app?
+#  - bij elke wijziging in de bestanden  -> testversie onder het tabblad "Actions"
+#  - als je een "Release" publiceert     -> installatieprogramma wordt aan de release toegevoegd
+#  - of handmatig via "Run workflow"
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Bestanden ophalen
+        uses: actions/checkout@v4
+
+      - name: Versie controleren (code = release)
+        if: github.event_name == 'release'
+        shell: pwsh
+        run: |
+          # Voorkomt dat een release een oude versie van de app bevat (bv. als het bestand
+          # onder een andere naam werd opgeladen en vr_starter.pyw niet vervangen werd).
+          $tag = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
+          $line = Select-String -Path "vr_starter.pyw" -Pattern '^APP_VERSION = "(.+)"' | Select-Object -First 1
+          if (-not $line) { Write-Error "APP_VERSION niet gevonden in vr_starter.pyw"; exit 1 }
+          $code = $line.Matches[0].Groups[1].Value
+          Write-Host "Release: $tag   Code (vr_starter.pyw): $code"
+          if ($code -ne $tag) {
+            Write-Error ("vr_starter.pyw is versie $code, maar de release heet v$tag. " +
+              "Vervang vr_starter.pyw door de nieuwe versie (exact deze naam, in de hoofdmap), " +
+              "verwijder deze release en de tag, en maak de release opnieuw.")
+            exit 1
+          }
+          $extra = Get-ChildItem -Filter "vr_starter*.pyw" | Where-Object { $_.Name -ne "vr_starter.pyw" }
+          if ($extra) { Write-Warning ("Extra app-bestanden gevonden (worden NIET gebruikt): " + ($extra.Name -join ", ")) }
+
+      - name: Python installeren
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: PyInstaller installeren
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Programma (.exe) bouwen
+        run: python -m PyInstaller --noconfirm --onedir --windowed --name "VR-viewer-starter" --icon app.ico vr_starter.pyw
+
+      - name: Versienummer bepalen
+        shell: pwsh
+        run: |
+          # testversie: versie uit vr_starter.pyw; release: versie uit de tag
+          $line = Select-String -Path "vr_starter.pyw" -Pattern '^APP_VERSION = "(.+)"' | Select-Object -First 1
+          $v = if ($line) { $line.Matches[0].Groups[1].Value } else { "1.0.0" }
+          if ("${{ github.event_name }}" -eq "release") { $v = "${{ github.event.release.tag_name }}".TrimStart("v", "V") }
+          "APP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Inno Setup installeren
+        run: choco install innosetup -y --no-progress
+
+      - name: Installatieprogramma bouwen
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:APP_VERSION" installer.iss'
+
+      - name: Testversie bewaren (tabblad Actions)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VR-viewer-starter-setup
+          path: output/VR-viewer-starter-setup.exe
+
+      - name: Toevoegen aan de release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "output/VR-viewer-starter-setup.exe" --clobber
