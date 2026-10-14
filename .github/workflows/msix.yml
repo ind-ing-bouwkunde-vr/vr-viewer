@@ -24,6 +24,26 @@ jobs:
       - name: Code ophalen
         uses: actions/checkout@v4
 
+      - name: Versie controleren (code = release)
+        if: github.event_name == 'release'
+        shell: pwsh
+        run: |
+          # Voorkomt dat een release een oude versie van de app bevat (bv. als het bestand
+          # onder een andere naam werd opgeladen en vr_starter.pyw niet vervangen werd).
+          $tag = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
+          $line = Select-String -Path "vr_starter.pyw" -Pattern '^APP_VERSION = "(.+)"' | Select-Object -First 1
+          if (-not $line) { Write-Error "APP_VERSION niet gevonden in vr_starter.pyw"; exit 1 }
+          $code = $line.Matches[0].Groups[1].Value
+          Write-Host "Release: $tag   Code (vr_starter.pyw): $code"
+          if ($code -ne $tag) {
+            Write-Error ("vr_starter.pyw is versie $code, maar de release heet v$tag. " +
+              "Vervang vr_starter.pyw door de nieuwe versie (exact deze naam, in de hoofdmap), " +
+              "verwijder deze release en de tag, en maak de release opnieuw.")
+            exit 1
+          }
+          $extra = Get-ChildItem -Filter "vr_starter*.pyw" | Where-Object { $_.Name -ne "vr_starter.pyw" }
+          if ($extra) { Write-Warning ("Extra app-bestanden gevonden (worden NIET gebruikt): " + ($extra.Name -join ", ")) }
+
       - name: Controleer de Store-gegevens
         shell: pwsh
         run: |
